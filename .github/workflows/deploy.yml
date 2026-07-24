@@ -34,6 +34,9 @@ jobs:
       - name: Controlla TypeScript
         run: npm run typecheck
 
+      - name: Esegui i test
+        run: npm test
+
       - name: Crea la build
         run: npm run build
 

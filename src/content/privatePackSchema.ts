@@ -1,0 +1,226 @@
+import {
+  PRIVATE_CONTENT_CATEGORIES,
+  PRIVATE_PACK_FORMAT,
+  PRIVATE_PACK_SCHEMA_VERSION,
+  type PackValidationIssue,
+  type PackValidationResult,
+  type PrivateContentCategory,
+  type PrivateContentItem,
+  type PrivateContentPack,
+} from '../types/privateContent'
+import { classOptions } from '../data/srd-5.2.1-it/catalog'
+
+const categorySet = new Set<string>(PRIVATE_CONTENT_CATEGORIES)
+const placeholderPattern = /\b(?:placeholder|segnaposto|todo|tbd|da definire)\b/i
+
+export function parseAndValidatePrivatePack(json: string): { pack?: PrivateContentPack; validation: PackValidationResult } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(json)
+  } catch {
+    return { validation: result([{ code: 'invalid-json', message: 'Il file non contiene JSON valido.', severity: 'error' }]) }
+  }
+  const validation = validatePrivatePack(parsed)
+  return validation.valid ? { pack: parsed as PrivateContentPack, validation } : { validation }
+}
+
+export function validatePrivatePack(value: unknown): PackValidationResult {
+  const issues: PackValidationIssue[] = []
+  if (!isRecord(value)) return result([{ code: 'invalid-root', message: 'Il pacchetto deve essere un oggetto JSON.', severity: 'error' }])
+  if (value.format !== PRIVATE_PACK_FORMAT) issues.push(error('invalid-format', `Il formato deve essere "${PRIVATE_PACK_FORMAT}".`))
+  if (value.schemaVersion !== PRIVATE_PACK_SCHEMA_VERSION) issues.push(error('unsupported-schema', `Versione schema non supportata: ${String(value.schemaVersion)}.`))
+  requireText(value.packId, 'packId', issues)
+  requireText(value.title, 'title', issues)
+  if (value.importedFrom !== 'user-owned-manual') issues.push(error('invalid-origin', 'Il pacchetto deve dichiarare importedFrom: "user-owned-manual".'))
+  if (!isDate(value.createdAt)) issues.push(error('invalid-created-at', 'createdAt deve essere una data ISO valida.'))
+  if (!Array.isArray(value.items)) {
+    issues.push(error('invalid-items', 'items deve essere un elenco.'))
+    return result(issues)
+  }
+
+  const ids = new Set<string>()
+  const items = value.items.filter(isRecord)
+  value.items.forEach((item, index) => {
+    if (!isRecord(item)) {
+      issues.push(error('invalid-item', `L’elemento ${index + 1} non è un oggetto.`))
+      return
+    }
+    validateItem(item, issues)
+    if (typeof item.id === 'string') {
+      const identity = `${String(item.category)}:${item.id}`
+      if (ids.has(identity)) issues.push(error('duplicate-id', `ID duplicato nella categoria: ${identity}.`, item.id))
+      ids.add(identity)
+    }
+  })
+  validateReferences(items as unknown as PrivateContentItem[], issues)
+  return result(issues, items as unknown as PrivateContentItem[])
+}
+
+function validateItem(item: Record<string, unknown>, issues: PackValidationIssue[]) {
+  const itemId = typeof item.id === 'string' ? item.id : undefined
+  requireText(item.id, 'id', issues, itemId)
+  if (typeof item.category !== 'string' || !categorySet.has(item.category)) {
+    issues.push(error('invalid-category', `Categoria non ammessa: ${String(item.category)}.`, itemId))
+  }
+  requireText(item.officialNameIt, 'officialNameIt', issues, itemId)
+  requireText(item.officialNameEn, 'officialNameEn', issues, itemId)
+  if (!isRecord(item.source)) issues.push(error('missing-source', 'Ogni elemento deve avere una fonte.', itemId))
+  else {
+    requireText(item.source.manual, 'source.manual', issues, itemId)
+    if (item.source.edition !== '2024') issues.push(error('invalid-edition', 'L’edizione deve essere 2024.', itemId))
+    if (!Number.isInteger(item.source.italianPage) || Number(item.source.italianPage) <= 0) issues.push(error('invalid-page', 'La pagina italiana deve essere un intero positivo.', itemId))
+    if (item.source.englishPage !== undefined && (!Number.isInteger(item.source.englishPage) || Number(item.source.englishPage) <= 0)) issues.push(error('invalid-english-page', 'La pagina inglese deve essere un intero positivo.', itemId))
+  }
+  if (!isRecord(item.mechanics) || Object.keys(item.mechanics).length === 0) issues.push(error('missing-mechanics', 'I dati meccanici strutturati sono obbligatori.', itemId))
+  if (!['verified', 'transcribed', 'incomplete', 'unverified'].includes(String(item.verificationStatus))) issues.push(error('invalid-verification', 'Stato di verifica non valido.', itemId))
+  if (!isDate(item.verifiedAt)) issues.push(error('invalid-verification-date', 'verifiedAt deve essere una data ISO valida.', itemId))
+  if (typeof item.active !== 'boolean') issues.push(error('invalid-active', 'active deve essere booleano.', itemId))
+  if (item.active === true && item.verificationStatus !== 'verified') issues.push(error('unverified-active', 'Un contenuto attivo deve essere verificato.', itemId))
+  if (placeholderPattern.test(JSON.stringify(item))) issues.push(error('placeholder', 'Il contenuto contiene un placeholder non ammesso.', itemId))
+  if (item.category === 'species' && isRecord(item.mechanics) && hasSpeciesAbilityBonus(item.mechanics)) {
+    issues.push(error('species-ability-bonus', 'Una specie non può fornire aumenti dei punteggi di caratteristica.', itemId))
+  }
+  validateCategoryMechanics(item, issues)
+}
+
+function validateCategoryMechanics(item: Record<string, unknown>, issues: PackValidationIssue[]) {
+  if (!isRecord(item.mechanics)) return
+  const id = typeof item.id === 'string' ? item.id : undefined
+  if (item.category === 'subclass') requireText(item.mechanics.classId, 'mechanics.classId', issues, id)
+  if (item.category === 'class') {
+    requireBuilderData(item.mechanics.builderData, 'class', issues, id)
+    requireStringArray(item.mechanics.featureIds, 'mechanics.featureIds', issues, id)
+    requireText(item.mechanics.progressionTableId, 'mechanics.progressionTableId', issues, id)
+  }
+  if (item.category === 'species' || item.category === 'background') requireBuilderData(item.mechanics.builderData, item.category, issues, id)
+  if (item.category === 'spell') requireStringArray(item.mechanics.listIds, 'mechanics.listIds', issues, id)
+  if (item.category === 'feat' && !Array.isArray(item.mechanics.prerequisites)) issues.push(error('invalid-prerequisites', 'Un talento deve dichiarare mechanics.prerequisites come elenco.', id))
+  if (item.category === 'progression-table') {
+    requireText(item.mechanics.classId, 'mechanics.classId', issues, id)
+    const levels = item.mechanics.levels
+    if (!Array.isArray(levels) || levels.length !== 20 || levels.some((level, index) => !isRecord(level) || level.level !== index + 1)) {
+      issues.push(error('invalid-progression', 'Una tabella di avanzamento deve contenere in ordine i livelli da 1 a 20.', id))
+    } else {
+      levels.slice(0, 10).forEach((level, index) => {
+        if (!isRecord(level) || level.complete !== true || typeof level.proficiencyBonus !== 'number'
+          || typeof level.fixedHitPointValue !== 'number' || !Array.isArray(level.grantedFeatureIds)
+          || !Array.isArray(level.requiredChoices) || !Array.isArray(level.resourceChanges)) {
+          issues.push(error('incomplete-supported-level', `Il livello ${index + 1} non contiene tutti i dati richiesti per l’avanzamento.`, id))
+        }
+        if (isRecord(level) && level.spellcastingProgression !== undefined) {
+          const spells = level.spellcastingProgression
+          if (!isRecord(spells) || !Array.isArray(spells.slots) || typeof spells.maximumSpellLevel !== 'number'
+            || typeof spells.cantrips !== 'number' || typeof spells.preparedOrKnown !== 'number'
+            || !Array.isArray(spells.automaticSpellIds) || !Array.isArray(spells.choices)) {
+            issues.push(error('invalid-spell-progression', `La progressione degli incantesimi al livello ${index + 1} è incompleta.`, id))
+          }
+        }
+      })
+    }
+  }
+}
+
+function requireBuilderData(value: unknown, category: 'class' | 'species' | 'background', issues: PackValidationIssue[], itemId?: string) {
+  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.nameIt !== 'string'
+    || !isRecord(value.source) || !Array.isArray(value.requiredChoices)) {
+    issues.push(error('invalid-builder-data', 'Classi, specie e background devono includere mechanics.builderData completo e strutturato.', itemId))
+    return
+  }
+  const commonText = ['shortDescription', 'icon']
+  if (commonText.some((key) => typeof value[key] !== 'string')) {
+    issues.push(error('invalid-builder-data', 'La definizione per il builder non contiene tutti i campi testuali richiesti.', itemId))
+  }
+  if (category === 'species') {
+    const arrays = ['resistances', 'proficiencies', 'traits', 'speciesSpells', 'abilityScoreIncreases']
+    if (typeof value.speedMeters !== 'number' || typeof value.size !== 'string' || typeof value.creatureType !== 'string'
+      || !['facile', 'media', 'avanzata'].includes(String(value.complexity))
+      || arrays.some((key) => !Array.isArray(value[key]))
+      || (Array.isArray(value.abilityScoreIncreases) && value.abilityScoreIncreases.length > 0)) {
+      issues.push(error('invalid-builder-species', 'La specie non contiene una definizione meccanica completa e priva di bonus alle caratteristiche.', itemId))
+    }
+  }
+  if (category === 'class') {
+    const arrays = [
+      'primaryAbilities', 'styles', 'filters', 'armorProficiencies', 'weaponProficiencies',
+      'toolProficiencies', 'savingThrows', 'skillChoices', 'startingEquipment',
+      'levelOneFeatures', 'strengths', 'considerations', 'suggestions',
+    ]
+    if (typeof value.role !== 'string' || typeof value.hitDie !== 'number'
+      || typeof value.levelOneHitPoints !== 'string' || typeof value.skillChoiceCount !== 'number'
+      || typeof value.goldAlternative !== 'number' || typeof value.weaponMasteryCount !== 'number'
+      || typeof value.hasLevelOneSpells !== 'boolean' || typeof value.howToPlay !== 'string'
+      || arrays.some((key) => !Array.isArray(value[key]))) {
+      issues.push(error('invalid-builder-class', 'La classe non contiene tutti i dati necessari all’automazione del builder.', itemId))
+    }
+  }
+}
+
+function validateReferences(items: PrivateContentItem[], issues: PackValidationIssue[]) {
+  const byIdentity = new Map(items.map((item) => [`${item.category}:${item.id}`, item]))
+  const classes = new Set(items.filter((item) => item.category === 'class').map((item) => item.id))
+  const srdClasses = new Set(classOptions.map((item) => item.id))
+  const features = new Set(items.filter((item) => item.category === 'feature').map((item) => item.id))
+  const tables = new Set(items.filter((item) => item.category === 'progression-table').map((item) => item.id))
+  const spellLists = new Set(items.filter((item) => item.category === 'class').map((item) => item.id))
+
+  items.forEach((item) => {
+    if (item.category === 'subclass' && typeof item.mechanics.classId === 'string' && !classes.has(item.mechanics.classId) && !srdClasses.has(item.mechanics.classId) && !item.extendsSrdId) {
+      issues.push(error('missing-class-reference', `La sottoclasse riferisce una classe assente: ${item.mechanics.classId}.`, item.id))
+    }
+    if (item.category === 'progression-table' && typeof item.mechanics.classId === 'string'
+      && !classes.has(item.mechanics.classId) && !srdClasses.has(item.mechanics.classId)) {
+      issues.push(error('missing-progression-class', `La tabella riferisce una classe assente: ${item.mechanics.classId}.`, item.id))
+    }
+    if (item.category === 'class') {
+      for (const featureId of stringArray(item.mechanics.featureIds)) if (!features.has(featureId)) issues.push(error('missing-feature-reference', `Capacità assente: ${featureId}.`, item.id))
+      if (typeof item.mechanics.progressionTableId === 'string' && !tables.has(item.mechanics.progressionTableId)) issues.push(error('missing-progression-reference', `Tabella assente: ${item.mechanics.progressionTableId}.`, item.id))
+    }
+    if (item.category === 'spell') {
+      for (const listId of stringArray(item.mechanics.listIds)) if (!spellLists.has(listId) && !srdClasses.has(listId) && !listId.startsWith('srd:')) issues.push(error('missing-spell-list', `Lista incantesimi assente: ${listId}.`, item.id))
+    }
+    if (item.category === 'progression-table' && Array.isArray(item.mechanics.levels)) {
+      for (const level of item.mechanics.levels.slice(0, 10)) {
+        if (!isRecord(level)) continue
+        for (const featureId of stringArray(level.grantedFeatureIds)) {
+          if (!features.has(featureId) && !featureId.startsWith('srd:')) {
+            issues.push(error('missing-level-feature-reference', `Capacità di livello assente: ${featureId}.`, item.id))
+          }
+        }
+      }
+    }
+    if (item.extendsSrdId && byIdentity.has(`${item.category}:${item.extendsSrdId}`)) {
+      issues.push({ code: 'redundant-extension', message: `extendsSrdId deve riferire contenuto SRD, non un altro elemento privato.`, itemId: item.id, severity: 'warning' })
+    }
+  })
+}
+
+function hasSpeciesAbilityBonus(mechanics: Record<string, unknown>): boolean {
+  return ['abilityScoreIncreases', 'abilityBonuses', 'abilityScoreBonus'].some((key) => {
+    const value = mechanics[key]
+    return Array.isArray(value) ? value.length > 0 : isRecord(value) ? Object.keys(value).length > 0 : value !== undefined
+  })
+}
+
+function result(issues: PackValidationIssue[], items: PrivateContentItem[] = []): PackValidationResult {
+  const counts = Object.fromEntries(PRIVATE_CONTENT_CATEGORIES.map((category) => [category, items.filter((item) => item.category === category).length])) as Record<PrivateContentCategory, number>
+  return { valid: issues.every((issue) => issue.severity !== 'error'), issues, counts }
+}
+
+function error(code: string, message: string, itemId?: string): PackValidationIssue {
+  return { code, message, itemId, severity: 'error' }
+}
+function requireText(value: unknown, field: string, issues: PackValidationIssue[], itemId?: string) {
+  if (typeof value !== 'string' || !value.trim()) issues.push(error('missing-text', `${field} è obbligatorio.`, itemId))
+}
+function requireStringArray(value: unknown, field: string, issues: PackValidationIssue[], itemId?: string) {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || !entry.trim())) issues.push(error('invalid-list', `${field} deve essere un elenco di ID.`, itemId))
+}
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : []
+}
+function isDate(value: unknown): value is string {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value))
+}
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}

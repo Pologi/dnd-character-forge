@@ -1,10 +1,31 @@
-import { useState } from 'react'
+import { lazy, Suspense, useMemo, useState } from 'react'
+import { CharacterDetail } from './components/CharacterDetail'
+import { CharactersPage } from './components/CharactersPage'
+import { CharacterBuilder } from './components/character-builder/CharacterBuilder'
+import { ContentManualsPage } from './components/ContentManualsPage'
+import { LevelUpWizard } from './components/level-up/LevelUpWizard'
+import {
+  getCharacters,
+  getDraft,
+  saveDraft,
+} from './storage/characterStorage'
+import {
+  characterToDraft,
+  createEmptyDraft,
+  type Character,
+  type CharacterDraft,
+} from './types/character'
+import { SRD_ATTRIBUTION, UNOFFICIAL_NOTICE, classOptions } from './data/srd-5.2.1-it/catalog'
 
-type View = 'home' | 'characters' | 'create'
+const PrivatePackEditor = import.meta.env.DEV ? lazy(() => import('./dev/PrivatePackEditor')) : null
+const PRIVATE_EDITOR_VIEW = import.meta.env.DEV ? 'private-editor' as const : 'development-editor-disabled' as const
 
-const navItems: { id: View; label: string }[] = [
+type View = 'home' | 'characters' | 'content' | 'create' | 'detail' | 'level-up' | typeof PRIVATE_EDITOR_VIEW
+
+const navItems: { id: 'home' | 'characters' | 'content'; label: string }[] = [
   { id: 'home', label: 'Inizio' },
   { id: 'characters', label: 'I miei personaggi' },
+  { id: 'content', label: 'Contenuti e manuali' },
 ]
 
 function BrandMark() {
@@ -18,10 +39,75 @@ function BrandMark() {
 
 function App() {
   const [view, setView] = useState<View>('home')
+  const [characters, setCharacters] = useState<Character[]>(() => getCharacters())
+  const [wizardDraft, setWizardDraft] = useState<CharacterDraft>(() => createEmptyDraft())
+  const [creationDirty, setCreationDirty] = useState(false)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [draftWasResumed, setDraftWasResumed] = useState(false)
+  const [sourcesOpen, setSourcesOpen] = useState(false)
+
+  const selectedCharacter = useMemo(
+    () => characters.find((character) => character.id === selectedId) ?? null,
+    [characters, selectedId],
+  )
+
+  const scrollToTop = () => window.scrollTo({ top: 0, behavior: 'smooth' })
 
   const navigate = (nextView: View) => {
+    if (
+      view === 'create' &&
+      nextView !== 'create' &&
+      creationDirty &&
+      !window.confirm('Vuoi abbandonare la creazione? La bozza resterà salvata nel browser.')
+    ) {
+      return
+    }
+    setCreationDirty(false)
     setView(nextView)
-    window.scrollTo({ top: 0, behavior: 'smooth' })
+    scrollToTop()
+  }
+
+  const startCreation = () => {
+    if (view === 'create') return
+    const savedDraft = getDraft()
+    setWizardDraft(savedDraft ?? createEmptyDraft())
+    setDraftWasResumed(savedDraft !== null)
+    setCreationDirty(false)
+    setView('create')
+    scrollToTop()
+  }
+
+  const editCharacter = (character: Character) => {
+    const draft = characterToDraft(character)
+    saveDraft(draft)
+    setWizardDraft(draft)
+    setDraftWasResumed(false)
+    setCreationDirty(false)
+    setView('create')
+    scrollToTop()
+  }
+
+  const refreshCharacters = () => setCharacters(getCharacters())
+
+  const openCharacter = (character: Character) => {
+    setSelectedId(character.id)
+    setView('detail')
+    scrollToTop()
+  }
+
+  const handleSaved = (character: Character) => {
+    refreshCharacters()
+    setSelectedId(character.id)
+    setCreationDirty(false)
+    setView(character.requestedLevel > 1 ? 'level-up' : 'detail')
+    scrollToTop()
+  }
+
+  const handleCharacterUpdated = (character: Character) => {
+    refreshCharacters()
+    setSelectedId(character.id)
+    setView(character.level < character.requestedLevel ? 'level-up' : 'detail')
+    scrollToTop()
   }
 
   return (
@@ -46,19 +132,74 @@ function App() {
               {item.label}
             </button>
           ))}
+          <button className="nav-link" onClick={() => setSourcesOpen(true)}>Fonti e licenze</button>
+          {import.meta.env.DEV && PrivatePackEditor && <button className={view === PRIVATE_EDITOR_VIEW ? 'nav-link active' : 'nav-link'} onClick={() => navigate(PRIVATE_EDITOR_VIEW)}>Editor Pacchetto Manuale</button>}
         </nav>
 
-        <button className="button button-small header-action" onClick={() => navigate('create')}>
+        <button className="button button-small header-action" onClick={startCreation}>
           <span aria-hidden="true">＋</span>
           Crea personaggio
         </button>
       </header>
 
       <main>
-        {view === 'home' && <HomePage onCreate={() => navigate('create')} onCharacters={() => navigate('characters')} />}
-        {view === 'characters' && <CharactersPage onCreate={() => navigate('create')} />}
-        {view === 'create' && <CreationPage onBack={() => navigate('home')} />}
+        {view === 'home' && (
+          <HomePage onCreate={startCreation} onCharacters={() => navigate('characters')} />
+        )}
+        {view === 'characters' && (
+          <CharactersPage
+            characters={characters}
+            onCreate={startCreation}
+            onOpen={openCharacter}
+            onEdit={editCharacter}
+            onCharactersChange={refreshCharacters}
+          />
+        )}
+        {view === 'content' && <ContentManualsPage />}
+        {view === 'create' && (
+          <CharacterBuilder
+            key={`${wizardDraft.id}-${draftWasResumed ? 'resumed' : 'new'}`}
+            initialDraft={wizardDraft}
+            resumed={draftWasResumed}
+            onDirtyChange={setCreationDirty}
+            onCancel={() => navigate('characters')}
+            onSaved={handleSaved}
+          />
+        )}
+        {view === 'detail' && selectedCharacter && (
+          <CharacterDetail
+            character={selectedCharacter}
+            onBack={() => navigate('characters')}
+            onEdit={() => editCharacter(selectedCharacter)}
+            onAdvance={() => navigate('level-up')}
+            onUpdated={handleCharacterUpdated}
+          />
+        )}
+        {view === 'level-up' && selectedCharacter && (() => {
+          const characterClass = classOptions.find((item) => item.id === selectedCharacter.classId)
+          return characterClass ? <LevelUpWizard
+            character={selectedCharacter}
+            characterClass={characterClass}
+            onCancel={() => navigate('detail')}
+            onComplete={handleCharacterUpdated}
+          /> : null
+        })()}
+        {view === PRIVATE_EDITOR_VIEW && PrivatePackEditor && <Suspense fallback={<p className="section-wrap">Apertura dell’editor locale…</p>}><PrivatePackEditor /></Suspense>}
       </main>
+
+      {sourcesOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setSourcesOpen(false)}>
+          <section className="license-modal" role="dialog" aria-modal="true" aria-labelledby="license-title" onMouseDown={(event) => event.stopPropagation()}>
+            <button type="button" className="modal-close" onClick={() => setSourcesOpen(false)} aria-label="Chiudi">×</button>
+            <span className="kicker">Trasparenza delle regole</span>
+            <h2 id="license-title">Fonti e licenze</h2>
+            <p>{SRD_ATTRIBUTION}</p>
+            <p><strong>{UNOFFICIAL_NOTICE}</strong></p>
+            <p>Le nove specie e le dodici classi con badge SRD usano dati meccanici del SRD 5.2.1 italiano. L’Aasimar è indicato esclusivamente come opzione ufficiale del Manuale del Giocatore 2024: i suoi tratti non sono inclusi nell’app.</p>
+            <p><a href="https://www.dndbeyond.com/srd" target="_blank" rel="noreferrer">System Reference Document 5.2.1</a> · <a href="https://creativecommons.org/licenses/by/4.0/legalcode" target="_blank" rel="noreferrer">Licenza CC BY 4.0</a></p>
+          </section>
+        </div>
+      )}
 
       <footer className="site-footer">
         <div className="footer-brand">
@@ -66,7 +207,8 @@ function App() {
           <span>D&amp;D Character Forge</span>
         </div>
         <p>La tua storia comincia da un personaggio.</p>
-        <span className="footer-note">Progetto indipendente per avventurieri</span>
+        <span className="footer-note">I dati restano su questo dispositivo</span>
+        <button className="footer-license-link" onClick={() => setSourcesOpen(true)}>Fonti e licenze</button>
       </footer>
     </div>
   )
@@ -118,7 +260,7 @@ function HomePage({ onCreate, onCharacters }: { onCreate: () => void; onCharacte
             <span className="feature-number">02</span>
             <div className="feature-icon" aria-hidden="true">⚒</div>
             <h3>Forgia</h3>
-            <p>Segui un percorso guidato per costruire il cuore del tuo personaggio.</p>
+            <p>Segui un percorso guidato e salva i progressi direttamente nel browser.</p>
           </article>
           <article className="feature-card">
             <span className="feature-number">03</span>
@@ -140,74 +282,6 @@ function HomePage({ onCreate, onCharacters }: { onCreate: () => void; onCharacte
         </button>
       </section>
     </>
-  )
-}
-
-function CharactersPage({ onCreate }: { onCreate: () => void }) {
-  return (
-    <section className="page-section section-wrap">
-      <div className="page-heading">
-        <span className="kicker">La tua compagnia</span>
-        <h1>I miei personaggi</h1>
-        <p>Qui troverai gli eroi che avrai forgiato.</p>
-      </div>
-      <div className="empty-state">
-        <div className="empty-emblem" aria-hidden="true">♜</div>
-        <span className="eyebrow"><span /> Il primo capitolo <span /></span>
-        <h2>La tua compagnia attende un eroe</h2>
-        <p>
-          Non hai ancora creato personaggi. Quando inizierai una nuova storia,
-          il suo protagonista apparirà qui.
-        </p>
-        <button className="button button-primary" onClick={onCreate}>
-          <span aria-hidden="true">＋</span> Crea nuovo personaggio
-        </button>
-      </div>
-    </section>
-  )
-}
-
-function CreationPage({ onBack }: { onBack: () => void }) {
-  return (
-    <section className="page-section creation-section">
-      <div className="creation-topbar section-wrap">
-        <button className="back-link" onClick={onBack}>
-          <span aria-hidden="true">←</span> Torna all'inizio
-        </button>
-        <span className="step-label">Introduzione</span>
-      </div>
-      <div className="creation-card">
-        <div className="creation-emblem" aria-hidden="true">
-          <BrandMark />
-        </div>
-        <span className="kicker">Creazione guidata</span>
-        <h1>È tempo di forgiare il tuo eroe</h1>
-        <p className="creation-lead">
-          Ti accompagneremo passo dopo passo. Per ora, prepara l'idea da cui
-          nascerà il tuo prossimo personaggio.
-        </p>
-        <div className="creation-preview" aria-label="Fasi previste">
-          <div className="preview-item active">
-            <span>1</span>
-            <div><strong>Il punto di partenza</strong><small>Definisci l'idea del tuo eroe</small></div>
-          </div>
-          <div className="preview-line" />
-          <div className="preview-item muted">
-            <span>2</span>
-            <div><strong>La tua storia</strong><small>Prossimamente</small></div>
-          </div>
-          <div className="preview-line" />
-          <div className="preview-item muted">
-            <span>3</span>
-            <div><strong>I dettagli</strong><small>Prossimamente</small></div>
-          </div>
-        </div>
-        <button className="button button-primary button-disabled" disabled>
-          La forgia aprirà presto
-        </button>
-        <small className="no-save-note">Questa anteprima non salva ancora alcun dato.</small>
-      </div>
-    </section>
   )
 }
 
